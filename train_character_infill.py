@@ -111,14 +111,34 @@ class CharacterInfillDataset(Dataset):
         image_root: str | Path = ".",
         style_to_index: Optional[Dict[str, int]] = None,
         patch_size: int = 256,
+        augment: bool = False,
     ) -> None:
         self.records = read_jsonl(jsonl_path)
         self.image_root = Path(image_root)
         self.style_to_index = style_to_index or {}
         self.patch_size = patch_size
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def _augment(
+        self, before: Tensor, after: Tensor, bbox_mask: Tensor, bbox: List[float],
+    ) -> Tuple[Tensor, Tensor, Tensor, List[float]]:
+        # Random brightness/contrast jitter (applied identically to before & after)
+        if random.random() < 0.5:
+            brightness = 1.0 + random.uniform(-0.15, 0.15)
+            contrast = 1.0 + random.uniform(-0.15, 0.15)
+            mean_val = 0.5
+            before = ((before - mean_val) * contrast + mean_val + (brightness - 1.0)).clamp(0, 1)
+            after = ((after - mean_val) * contrast + mean_val + (brightness - 1.0)).clamp(0, 1)
+        # Random horizontal flip
+        if random.random() < 0.5:
+            before = before.flip(-1)
+            after = after.flip(-1)
+            bbox_mask = bbox_mask.flip(-1)
+            bbox = [1.0 - bbox[0], bbox[1], bbox[2], bbox[3]]  # mirror cx
+        return before, after, bbox_mask, bbox
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         rec = self.records[idx]
@@ -135,6 +155,9 @@ class CharacterInfillDataset(Dataset):
         bbox = rec.get("target_bbox_parent_norm_cxcywh")
         if bbox is None:
             bbox = [0.5, 0.5, 0.5, 0.5]
+
+        if self.augment:
+            before, after, bbox_mask, bbox = self._augment(before, after, bbox_mask, bbox)
 
         return {
             "record_id": rec["record_id"],
@@ -182,6 +205,23 @@ class ConvBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.conv(x)
+
+
+class SelfAttention2d(nn.Module):
+    """Multi-head self-attention on spatial feature maps."""
+
+    def __init__(self, ch: int, num_heads: int = 4) -> None:
+        super().__init__()
+        self.norm = nn.GroupNorm(min(8, ch), ch)
+        self.attn = nn.MultiheadAttention(ch, num_heads, batch_first=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        h = h.reshape(B, C, H * W).permute(0, 2, 1)  # [B, HW, C]
+        h, _ = self.attn(h, h, h)
+        h = h.permute(0, 2, 1).reshape(B, C, H, W)
+        return x + h
 
 
 class FiLMModulation(nn.Module):
@@ -245,19 +285,24 @@ class ConditionalUNet(nn.Module):
         # Bottleneck
         self.bottleneck = ConvBlock(ch * 8, ch * 8)
         self.film_bn = FiLMModulation(cond_dim, ch * 8)
+        self.attn_bn = SelfAttention2d(ch * 8)
 
-        # Decoder
+        # Decoder (with FiLM conditioning)
         self.up4 = nn.ConvTranspose2d(ch * 8, ch * 8, 2, stride=2)
         self.dec4 = ConvBlock(ch * 16, ch * 4)
+        self.film_d4 = FiLMModulation(cond_dim, ch * 4)
 
         self.up3 = nn.ConvTranspose2d(ch * 4, ch * 4, 2, stride=2)
         self.dec3 = ConvBlock(ch * 8, ch * 2)
+        self.film_d3 = FiLMModulation(cond_dim, ch * 2)
 
         self.up2 = nn.ConvTranspose2d(ch * 2, ch * 2, 2, stride=2)
         self.dec2 = ConvBlock(ch * 4, ch)
+        self.film_d2 = FiLMModulation(cond_dim, ch)
 
         self.up1 = nn.ConvTranspose2d(ch, ch, 2, stride=2)
         self.dec1 = ConvBlock(ch * 2, ch)
+        self.film_d1 = FiLMModulation(cond_dim, ch)
 
         self.out_conv = nn.Conv2d(ch, out_ch, 1)
 
@@ -310,12 +355,17 @@ class ConditionalUNet(nn.Module):
         # Bottleneck
         bn = self.bottleneck(self.down4(e4))
         bn = self.film_bn(bn, cond)
+        bn = self.attn_bn(bn)
 
         # Decoder
         d4 = self.dec4(torch.cat([self.up4(bn), e4], dim=1))
+        d4 = self.film_d4(d4, cond)
         d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d3 = self.film_d3(d3, cond)
         d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d2 = self.film_d2(d2, cond)
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        d1 = self.film_d1(d1, cond)
 
         return self.out_conv(d1)  # [B,1,H,W] — predicted delta
 
@@ -335,12 +385,18 @@ def compute_infill_loss(
     inside = bbox_mask
     # Outside bbox (halo): lower weight
     outside = 1.0 - bbox_mask
-    weight_map = inside + halo_weight * outside
 
     l1 = torch.abs(pred_delta - target_delta)
-    weighted_l1 = (l1 * weight_map).mean(dim=(1, 2, 3))
 
-    loss = (weighted_l1 * confidence).sum() / confidence.sum().clamp_min(1.0)
+    # Normalize inside and outside L1 separately per sample so that
+    # small-bbox characters get equal gradient pressure as large ones.
+    inside_count = inside.sum(dim=(1, 2, 3)).clamp_min(1.0)
+    outside_count = outside.sum(dim=(1, 2, 3)).clamp_min(1.0)
+    per_sample_inside = (l1 * inside).sum(dim=(1, 2, 3)) / inside_count
+    per_sample_outside = (l1 * outside).sum(dim=(1, 2, 3)) / outside_count
+    per_sample_loss = per_sample_inside + halo_weight * per_sample_outside
+
+    loss = (per_sample_loss * confidence).sum() / confidence.sum().clamp_min(1.0)
 
     # Metrics
     with torch.no_grad():
@@ -375,6 +431,7 @@ def run_epoch(
     device: torch.device,
     grad_clip: float,
     halo_weight: float,
+    scheduler: Optional[Any] = None,
 ) -> Dict[str, float]:
     train = optimizer is not None
     model.train(train)
@@ -413,6 +470,9 @@ def run_epoch(
         sums["inside_l1"] += metrics["inside_l1"] * bs
         sums["outside_l1"] += metrics["outside_l1"] * bs
         sums["count"] += bs
+
+    if train and scheduler is not None:
+        scheduler.step()
 
     count = max(1, sums["count"])
     return {k: (v / count if k != "count" else v) for k, v in sums.items()}
@@ -456,7 +516,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image-root", default=".")
     p.add_argument("--out-dir", required=True)
 
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -504,6 +564,7 @@ def main() -> None:
         jsonl_path=args.train_jsonl,
         image_root=args.image_root,
         style_to_index=style_to_index,
+        augment=True,
     )
     val_ds = CharacterInfillDataset(
         jsonl_path=args.val_jsonl,
@@ -536,16 +597,21 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+    )
 
     best_val = float("inf")
     history: List[Dict[str, Any]] = []
 
     for epoch in range(1, args.epochs + 1):
-        print(f"\nEpoch {epoch}/{args.epochs}")
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(f"\nEpoch {epoch}/{args.epochs}  lr={lr_now:.2e}")
 
         train_metrics = run_epoch(
             model, train_loader, optimizer, device,
             grad_clip=args.grad_clip, halo_weight=args.halo_weight,
+            scheduler=scheduler,
         )
 
         val_metrics = run_epoch(
