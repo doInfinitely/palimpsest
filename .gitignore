@@ -5,4 +5,5 @@ data/
 runs/
 eval_output/
 *.pt
+*.log
 nohup.out

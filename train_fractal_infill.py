@@ -139,6 +139,30 @@ def collate_fractal(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 # Infiller Model
 # ============================================================
 
+class PrintEncoder(nn.Module):
+    """[B, 1, 32, 32] printed-glyph image → [B, cond_dim] vector.
+
+    Used as an optional additive conditioning signal so the generator
+    gets a shape prior of the target letter (rendered in a random printed
+    font, sampled per training example)."""
+
+    def __init__(self, cond_dim: int = 128) -> None:
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(1, 16, 3, stride=2, padding=1),   # 32 → 16
+            nn.GroupNorm(4, 16), nn.GELU(),
+            nn.Conv2d(16, 32, 3, stride=2, padding=1),  # 16 → 8
+            nn.GroupNorm(8, 32), nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),  # 8 → 4
+            nn.GroupNorm(8, 64), nn.GELU(),
+        )
+        self.head = nn.Linear(64 * 4 * 4, cond_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Invert so ink is positive (clearer signal for the small CNN).
+        return self.head(self.body(1.0 - x).flatten(1))
+
+
 class FractalInfiller(nn.Module):
     """Single-pass infill UNet with FiLM conditioning."""
 
@@ -150,15 +174,31 @@ class FractalInfiller(nn.Module):
         cond_dim: int = 128,
         vocab_size: int = 256,
         num_styles: int = 64,
+        noise_dim: int = 0,
+        use_print_cond: bool = False,
     ) -> None:
         super().__init__()
         ch = base_ch
+        self.noise_dim = noise_dim
+        self.use_print_cond = use_print_cond
 
         # Conditioning
         self.char_embed = nn.Embedding(vocab_size, cond_dim)
         self.style_embed = nn.Embedding(num_styles, cond_dim)
         self.bbox_proj = nn.Linear(4, cond_dim)
-        self.cond_proj = nn.Linear(cond_dim * 3, cond_dim)
+        cond_in = cond_dim * 3
+        if noise_dim > 0:
+            self.noise_proj = nn.Linear(noise_dim, cond_dim)
+            cond_in = cond_dim * 4
+        self.cond_proj = nn.Linear(cond_in, cond_dim)
+
+        # Additive printed-glyph conditioning. Zero-init projection so a
+        # checkpoint resumed without print signal behaves identically at
+        # step 0; training then teaches the proj to use the signal.
+        if use_print_cond:
+            self.print_encoder = PrintEncoder(cond_dim)
+            self.print_proj = nn.Linear(cond_dim, cond_dim, bias=False)
+            nn.init.zeros_(self.print_proj.weight)
 
         # Encoder
         self.enc1 = ConvBlock(in_ch, ch)
@@ -201,7 +241,8 @@ class FractalInfiller(nn.Module):
 
         self.out_conv = nn.Conv2d(ch, out_ch, 1)
 
-    def _get_cond(self, char_tokens, char_lengths, style_index, bbox):
+    def _get_cond(self, char_tokens, char_lengths, style_index, bbox,
+                  noise=None, print_glyph=None):
         if char_tokens.shape[1] > 0:
             char_emb = self.char_embed(char_tokens)
             mask = torch.arange(char_tokens.shape[1], device=char_tokens.device).unsqueeze(0) < char_lengths.unsqueeze(1)
@@ -210,7 +251,16 @@ class FractalInfiller(nn.Module):
             char_emb = torch.zeros(char_tokens.shape[0], self.char_embed.embedding_dim, device=char_tokens.device)
         style_emb = self.style_embed(style_index)
         bbox_emb = self.bbox_proj(bbox)
-        return self.cond_proj(torch.cat([char_emb, style_emb, bbox_emb], dim=-1))
+        parts = [char_emb, style_emb, bbox_emb]
+        if self.noise_dim > 0:
+            if noise is None:
+                noise = torch.randn(char_tokens.size(0), self.noise_dim,
+                                    device=char_tokens.device)
+            parts.append(self.noise_proj(noise))
+        cond = self.cond_proj(torch.cat(parts, dim=-1))
+        if self.use_print_cond and print_glyph is not None:
+            cond = cond + self.print_proj(self.print_encoder(print_glyph))
+        return cond
 
     def _encode(self, before, bbox_mask, cond):
         x = torch.cat([before, bbox_mask], dim=1)
@@ -230,9 +280,14 @@ class FractalInfiller(nn.Module):
         d1 = self.film_d1(self.dec1(torch.cat([self.up1(d2), e1], dim=1)), cond)
         return self.out_conv(d1)
 
-    def forward_infill(self, before, bbox_mask, char_tokens, char_lengths, style_index, bbox):
-        """Single-pass infill. Returns pred_delta."""
-        cond = self._get_cond(char_tokens, char_lengths, style_index, bbox)
+    def forward_infill(self, before, bbox_mask, char_tokens, char_lengths,
+                       style_index, bbox, noise=None, print_glyph=None):
+        """Single-pass infill. Returns pred_delta. If noise_dim>0, a fresh
+        noise vector is sampled per call unless `noise` is provided.
+        `print_glyph` is an optional [B, 1, 32, 32] printed-letter image
+        used as an additional shape prior when use_print_cond=True."""
+        cond = self._get_cond(char_tokens, char_lengths, style_index, bbox,
+                              noise, print_glyph)
         e1, e2, e3, e4, bn = self._encode(before, bbox_mask, cond)
         return self._decode(e1, e2, e3, e4, bn, cond)
 

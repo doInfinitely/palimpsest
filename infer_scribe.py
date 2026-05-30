@@ -92,6 +92,7 @@ def render_word(
     device: torch.device,
     style_index: int = 0,
     x_margin: int | None = None,
+    print_glyphs: torch.Tensor | None = None,
 ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
     """Render one word into a 64×256 letterbox. Returns (word_arr, word_bbox_in_letterbox).
 
@@ -162,8 +163,14 @@ def render_word(
         # Before = current canvas with the target region painted white (already is).
         before = canvas_t
 
+        # Print glyph for the target letter, if print conditioning is in use.
+        pg = None
+        if print_glyphs is not None and ch in VOCAB:
+            pg = print_glyphs[VOCAB.index(ch)].to(device).unsqueeze(0)  # [1,1,S,S]
+
         pred_delta = gen.forward_infill(
             before, bm, char_tokens, char_lengths, style_t, bbox_t,
+            print_glyph=pg,
         )
         pred_after = (before + pred_delta).clamp(0, 1)
         # Only commit pixels inside the mask (keep outside untouched).
@@ -208,6 +215,13 @@ def main() -> None:
     ap.add_argument("--right-margin", type=int, default=24)
     ap.add_argument("--top-margin", type=int, default=8)
     ap.add_argument("--bottom-margin", type=int, default=8)
+    ap.add_argument("--print-glyphs", type=str, default=None,
+                    help="Path to print-glyph cache (runs/print_glyphs.pt). "
+                         "Required if the infill ckpt was trained with print "
+                         "conditioning. At inference a single font is chosen "
+                         "(via --print-font-idx) for consistency.")
+    ap.add_argument("--print-font-idx", type=int, default=0,
+                    help="Which font in the cache to use for inference glyphs.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -228,9 +242,31 @@ def main() -> None:
 
     # Load infill generator.
     inf_ck = torch.load(args.infill_ckpt, map_location=device, weights_only=False)
-    gen = FractalInfiller().to(device)
+    inf_args = inf_ck.get("args", {}) or {}
+    noise_dim = int(inf_args.get("noise_dim", 0))
+    use_print_cond = bool(inf_args.get("print_glyphs"))
+    gen = FractalInfiller(
+        noise_dim=noise_dim,
+        use_print_cond=use_print_cond,
+    ).to(device)
     gen.load_state_dict(inf_ck["gen_state_dict"])
     gen.eval()
+
+    # Load print-glyph cache if needed (or if user opted in).
+    print_glyphs_tensor: torch.Tensor | None = None
+    if args.print_glyphs:
+        pcache = torch.load(args.print_glyphs, weights_only=False)
+        # Pick one font for inference consistency.
+        idx = max(0, min(args.print_font_idx, pcache["glyphs"].shape[0] - 1))
+        # [C, S, S] uint8 → [C, 1, S, S] float [0,1]
+        print_glyphs_tensor = (
+            pcache["glyphs"][idx].float().unsqueeze(1) / 255.0)
+        print(f"Using print glyphs: font #{idx} of {pcache['glyphs'].shape[0]} "
+              f"({Path(pcache['font_paths'][idx]).name})")
+    elif use_print_cond:
+        print("[warn] checkpoint uses print conditioning but --print-glyphs "
+              "not given; the model will receive no print signal at inference, "
+              "which may degrade output quality.")
 
     style_index = style_from_seed(args.style_seed)
     print(f"Using style_index={style_index} (seed={args.style_seed!r})")
@@ -257,6 +293,7 @@ def main() -> None:
                                     line_height=lh_norm, max_len=max_len)
         word_arr, word_bbox = render_word(
             filtered, boxes_px, gen, device, style_index=style_index,
+            print_glyphs=print_glyphs_tensor,
         )
         # Crop the word strip to tight horizontal bounds (word_bbox x coords),
         # trimmed to the 256-wide letterbox.

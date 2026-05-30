@@ -233,20 +233,17 @@ def generator_loss(
     halo_weight: float = 0.2,
     lambda_adv: float = 0.01,
     lambda_perc: float = 0.1,
+    lambda_l1: float = 1.0,
 ) -> Tuple[Tensor, Dict[str, float]]:
-    """Combined generator loss: L1 + perceptual + adversarial."""
-    # L1 infill loss
+    """Combined generator loss: L1 + perceptual + adversarial.
+    lambda_l1 scales the pixel L1 term (default 1.0; set 0 to disable)."""
     l1_loss, l1_metrics = compute_infill_loss(
         pred_delta, target_delta, bbox_mask, confidence, halo_weight,
     )
-
-    # Adversarial loss (generator wants D to say "real")
     adv_loss = F.mse_loss(d_fake, torch.ones_like(d_fake))
-
-    # Perceptual loss (on full reconstructed images)
     perc_loss = vgg_loss_fn(pred_after, target_after)
 
-    total = l1_loss + lambda_adv * adv_loss + lambda_perc * perc_loss
+    total = lambda_l1 * l1_loss + lambda_adv * adv_loss + lambda_perc * perc_loss
 
     metrics = {
         "g_total": float(total.detach()),
